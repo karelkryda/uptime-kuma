@@ -1,19 +1,31 @@
 let express = require("express");
-const { allowDevAllOrigin, getSettings, setting } = require("../util-server");
+const { allowDevAllOrigin } = require("../util-server");
 const { R } = require("redbean-node");
-const server = require("../server");
 const apicache = require("../modules/apicache");
 const Monitor = require("../model/monitor");
 const dayjs = require("dayjs");
-const { UP, MAINTENANCE, flipStatus, debug } = require("../../src/util");
+const { UP, MAINTENANCE, flipStatus, log } = require("../../src/util");
+const StatusPage = require("../model/status_page");
+const { UptimeKumaServer } = require("../uptime-kuma-server");
 let router = express.Router();
 
 let cache = apicache.middleware;
+const server = UptimeKumaServer.getInstance();
 let io = server.io;
 
-router.get("/api/entry-page", async (_, response) => {
+router.get("/api/entry-page", async (request, response) => {
     allowDevAllOrigin(response);
-    response.json(server.entryPage);
+
+    let result = { };
+
+    if (request.hostname in StatusPage.domainMappingList) {
+        result.type = "statusPageMatchedDomain";
+        result.statusPageSlug = StatusPage.domainMappingList[request.hostname];
+    } else {
+        result.type = "entryPage";
+        result.entryPage = server.entryPage;
+    }
+    response.json(result);
 });
 
 router.get("/api/push/:pushToken", async (request, response) => {
@@ -56,8 +68,8 @@ router.get("/api/push/:pushToken", async (request, response) => {
             status = MAINTENANCE;
         }
 
-        debug("PreviousStatus: " + previousStatus);
-        debug("Current Status: " + status);
+        log.debug("router", "PreviousStatus: " + previousStatus);
+        log.debug("router", "Current Status: " + status);
 
         bean.important = Monitor.isImportantBeat(isFirstBeat, previousStatus, status);
         bean.monitor_id = monitor.id;
@@ -87,48 +99,52 @@ router.get("/api/push/:pushToken", async (request, response) => {
     }
 });
 
-// Status Page Config
-router.get("/api/status-page/config", async (_request, response) => {
+// Status page config, incident, monitor list
+router.get("/api/status-page/:slug", cache("5 minutes"), async (request, response) => {
     allowDevAllOrigin(response);
+    let slug = request.params.slug;
 
-    let config = await getSettings("statusPage");
+    // Get Status Page
+    let statusPage = await R.findOne("status_page", " slug = ? ", [
+        slug
+    ]);
 
-    if (! config.statusPageTheme) {
-        config.statusPageTheme = "light";
+    if (!statusPage) {
+        response.statusCode = 404;
+        response.json({
+            msg: "Not Found"
+        });
+        return;
     }
-
-    if (! config.statusPagePublished) {
-        config.statusPagePublished = true;
-    }
-
-    if (! config.statusPageTags) {
-        config.statusPageTags = false;
-    }
-
-    if (! config.title) {
-        config.title = "Uptime Kuma";
-    }
-
-    response.json(config);
-});
-
-// Status Page - Get the current Incident
-// Can fetch only if published
-router.get("/api/status-page/incident", async (_, response) => {
-    allowDevAllOrigin(response);
 
     try {
-        await checkPublished();
-
-        let incident = await R.findOne("incident", " pin = 1 AND active = 1");
+        // Incident
+        let incident = await R.findOne("incident", " pin = 1 AND active = 1 AND status_page_id = ? ", [
+            statusPage.id,
+        ]);
 
         if (incident) {
             incident = incident.toPublicJSON();
         }
 
+        // Public Group List
+        const publicGroupList = [];
+        const showTags = !!statusPage.show_tags;
+
+        const list = await R.find("group", " public = 1 AND status_page_id = ? ORDER BY weight ", [
+            statusPage.id
+        ]);
+
+        for (let groupBean of list) {
+            let monitorGroup = await groupBean.toPublicJSON(showTags);
+            publicGroupList.push(monitorGroup);
+        }
+
+        // Response
         response.json({
-            ok: true,
+            config: await statusPage.toPublicJSON(),
             incident,
+            publicGroupList
         });
 
     } catch (error) {
@@ -205,20 +221,24 @@ router.get("/api/status-page/monitor-list", cache("5 minutes"), async (_request,
 
 // Status Page Polling Data
 // Can fetch only if published
-router.get("/api/status-page/heartbeat", cache("5 minutes"), async (_request, response) => {
+router.get("/api/status-page/heartbeat/:slug", cache("1 minutes"), async (request, response) => {
     allowDevAllOrigin(response);
 
     try {
-        await checkPublished();
-
         let heartbeatList = {};
         let uptimeList = {};
+
+        let slug = request.params.slug;
+        let statusPageID = await StatusPage.slugToID(slug);
 
         let monitorIDList = await R.getCol(`
             SELECT monitor_group.monitor_id FROM monitor_group, \`group\`
             WHERE monitor_group.group_id = \`group\`.id
             AND public = 1
-        `);
+            AND \`group\`.status_page_id = ?
+        `, [
+            statusPageID
+        ]);
 
         for (let monitorID of monitorIDList) {
             let list = await R.getAll(`
@@ -247,24 +267,11 @@ router.get("/api/status-page/heartbeat", cache("5 minutes"), async (_request, re
     }
 });
 
-async function checkPublished() {
-    if (! await isPublished()) {
-        throw new Error("The status page is not published");
-    }
-}
-
 /**
- * Default is published
- * @returns {Promise<boolean>}
+ * Send a 403 response
+ * @param {Object} res Express response object
+ * @param {string} [msg=""] Message to send
  */
-async function isPublished() {
-    const value = await setting("statusPagePublished");
-    if (value === null) {
-        return true;
-    }
-    return value;
-}
-
 function send403(res, msg = "") {
     res.status(403).json({
         "status": "fail",
